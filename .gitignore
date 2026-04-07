@@ -1,0 +1,25 @@
+# Binaries
+ai-gateway
+*.exe
+
+# SQLite database
+*.db
+*.db-shm
+*.db-wal
+
+# Environment
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts
+dist/
+bin/
