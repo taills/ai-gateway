@@ -100,7 +100,9 @@ func RelayTextHelper(c *gin.Context) *relaymodel.ErrorWithStatusCode {
 		}
 	}
 	c.Status(upstreamResp.StatusCode)
-	c.Writer.Write(upstreamRespBody) //nolint:errcheck
+	if _, err := c.Writer.Write(upstreamRespBody); err != nil {
+		logger.Warnf(ctx, "failed to write response body to client: %v", err)
+	}
 
 	// ── PostgreSQL quota accounting (async so it doesn't block response) ─────
 	go postConsumeQuota(ctx, m, &textRequest, &usage, startTime)

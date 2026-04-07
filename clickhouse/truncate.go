@@ -9,9 +9,12 @@ func TruncateText(s string, maxBytes int) (string, bool) {
 	if maxBytes <= 0 || len(s) <= maxBytes {
 		return s, false
 	}
-	// Walk back until we are on a valid rune boundary.
-	for !utf8.RuneStart(s[maxBytes]) {
+	// Walk back until we are on a valid rune boundary or reach index 0.
+	for maxBytes > 0 && !utf8.RuneStart(s[maxBytes]) {
 		maxBytes--
+	}
+	if maxBytes == 0 {
+		return "", true
 	}
 	return s[:maxBytes], true
 }
