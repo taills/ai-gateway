@@ -2,8 +2,7 @@ package clickhouse
 
 import (
 	"context"
-	"database/sql"
-	"strings"
+	"fmt"
 	"sync"
 	"time"
 
@@ -14,7 +13,7 @@ import (
 // Writes are completely decoupled from the request path so that ClickHouse
 // downtime or slowness never affects API latency.
 type asyncWorker struct {
-	db            *sql.DB
+	client        *httpClient
 	batchSize     int
 	flushInterval time.Duration
 
@@ -23,7 +22,7 @@ type asyncWorker struct {
 	wg     sync.WaitGroup
 }
 
-func newAsyncWorker(db *sql.DB, batchSize int, flushInterval time.Duration) *asyncWorker {
+func newAsyncWorker(client *httpClient, batchSize int, flushInterval time.Duration) *asyncWorker {
 	if batchSize <= 0 {
 		batchSize = 500
 	}
@@ -31,7 +30,7 @@ func newAsyncWorker(db *sql.DB, batchSize int, flushInterval time.Duration) *asy
 		flushInterval = 5 * time.Second
 	}
 	return &asyncWorker{
-		db:            db,
+		client:        client,
 		batchSize:     batchSize,
 		flushInterval: flushInterval,
 		queue:          make(chan *APICallLog, batchSize*10),
@@ -102,63 +101,64 @@ func (w *asyncWorker) loop() {
 	}
 }
 
-// writeBatch inserts a slice of log entries into ClickHouse using a single
-// batch INSERT statement.
+// writeBatch converts the slice of log entries into JSONEachRow rows and sends
+// them to ClickHouse via the HTTP interface.
 func (w *asyncWorker) writeBatch(entries []*APICallLog) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
-	const insertSQL = `INSERT INTO llm_api_call_log
-(created_at, request_id,
- user_id, username, token_id, token_name, channel_id, channel_name, provider, model_id, model_name,
- status, http_status_code, error_code, error_message,
- is_stream, latency_ms, ttft_ms,
- prompt_tokens, completion_tokens, total_tokens, quota,
- request_text, response_text, request_json, response_json,
- request_text_truncated, response_text_truncated, request_json_truncated, response_json_truncated)
-VALUES `
-
-	placeholders := make([]string, len(entries))
-	args := make([]any, 0, len(entries)*30)
-
+	rows := make([]map[string]any, len(entries))
 	for i, e := range entries {
-		placeholders[i] = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 		isStream := uint8(0)
 		if e.IsStream {
 			isStream = 1
 		}
-		reqTrunc := uint8(0)
-		if e.RequestTextTruncated {
-			reqTrunc = 1
+		rows[i] = map[string]any{
+			"created_at":              e.CreatedAt.Format("2006-01-02 15:04:05.000"),
+			"request_id":              e.RequestID,
+			"user_id":                 e.UserID,
+			"username":                e.Username,
+			"token_id":                e.TokenID,
+			"token_name":              e.TokenName,
+			"channel_id":              e.ChannelID,
+			"channel_name":            e.ChannelName,
+			"provider":                e.Provider,
+			"model_id":                e.ModelID,
+			"model_name":              e.ModelName,
+			"status":                  e.Status,
+			"http_status_code":        e.HTTPStatusCode,
+			"error_code":              e.ErrorCode,
+			"error_message":           e.ErrorMessage,
+			"is_stream":               isStream,
+			"latency_ms":              e.LatencyMs,
+			"ttft_ms":                 e.TTFTMs,
+			"prompt_tokens":           e.PromptTokens,
+			"completion_tokens":       e.CompletionTokens,
+			"total_tokens":            e.TotalTokens,
+			"quota":                   e.Quota,
+			"request_text":            e.RequestText,
+			"response_text":           e.ResponseText,
+			"request_json":            e.RequestJSON,
+			"response_json":           e.ResponseJSON,
+			"request_text_truncated":  boolToUint8(e.RequestTextTruncated),
+			"response_text_truncated": boolToUint8(e.ResponseTextTruncated),
+			"request_json_truncated":  boolToUint8(e.RequestJSONTruncated),
+			"response_json_truncated": boolToUint8(e.ResponseJSONTruncated),
 		}
-		respTrunc := uint8(0)
-		if e.ResponseTextTruncated {
-			respTrunc = 1
-		}
-		reqJSONTrunc := uint8(0)
-		if e.RequestJSONTruncated {
-			reqJSONTrunc = 1
-		}
-		respJSONTrunc := uint8(0)
-		if e.ResponseJSONTruncated {
-			respJSONTrunc = 1
-		}
-		args = append(args,
-			e.CreatedAt, e.RequestID,
-			e.UserID, e.Username, e.TokenID, e.TokenName, e.ChannelID, e.ChannelName, e.Provider, e.ModelID, e.ModelName,
-			e.Status, e.HTTPStatusCode, e.ErrorCode, e.ErrorMessage,
-			isStream, e.LatencyMs, e.TTFTMs,
-			e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.Quota,
-			e.RequestText, e.ResponseText, e.RequestJSON, e.ResponseJSON,
-			reqTrunc, respTrunc, reqJSONTrunc, respJSONTrunc,
-		)
 	}
 
-	query := insertSQL + strings.Join(placeholders, ",")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if err := w.client.insertJSONEachRow(ctx, "llm_api_call_log", rows); err != nil {
+		return fmt.Errorf("insert batch: %w", err)
+	}
+	return nil
+}
 
-	_, err := w.db.ExecContext(ctx, query, args...)
-	return err
+func boolToUint8(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
 }

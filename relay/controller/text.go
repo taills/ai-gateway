@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -54,7 +56,10 @@ func RelayTextHelper(c *gin.Context) *relaymodel.ErrorWithStatusCode {
 	}
 
 	// ── Forward to upstream ──────────────────────────────────────────────────
-	upstreamURL := buildUpstreamURL(m.BaseURL, c.FullPath())
+	upstreamURL, err := buildUpstreamURL(m.BaseURL, c.FullPath())
+	if err != nil {
+		return wrapError(err, "invalid_channel_base_url", http.StatusBadGateway)
+	}
 	upstreamResp, upstreamRespBody, upstreamErr := forwardRequest(c, upstreamURL, m.APIKey, body)
 
 	startTime := m.StartTime
@@ -125,11 +130,26 @@ func forwardRequest(c *gin.Context, url, apiKey string, body []byte) (*http.Resp
 	return resp, respBody, err
 }
 
-func buildUpstreamURL(baseURL, path string) string {
+// buildUpstreamURL constructs the full upstream URL from the channel's base URL
+// and the request path. The baseURL is validated to be a safe http/https URL
+// stored in the database by an administrator; invalid schemes are rejected.
+func buildUpstreamURL(baseURL, path string) (string, error) {
 	if baseURL == "" {
 		baseURL = "https://api.openai.com"
 	}
-	return baseURL + path
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid channel base_url: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("channel base_url must use http or https scheme, got %q", parsed.Scheme)
+	}
+	// Ensure path starts with /
+	if path != "" && path[0] != '/' {
+		path = "/" + path
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + path
+	return parsed.String(), nil
 }
 
 // buildClickHouseEntry assembles a ClickHouse log entry from all available

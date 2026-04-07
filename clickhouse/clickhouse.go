@@ -1,24 +1,23 @@
 // Package clickhouse provides asynchronous ClickHouse-backed logging for LLM
-// API request/response events. It is designed to be non-blocking: log entries
-// are queued in memory and flushed in batches so that the hot request path is
-// never delayed by ClickHouse availability.
+// API request/response events. It uses ClickHouse's HTTP interface (port 8123)
+// with JSONEachRow format for inserts, requiring no native driver and avoiding
+// dependency conflicts. Writes are batched and non-blocking.
 package clickhouse
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/taills/ai-gateway/common/config"
 	"github.com/taills/ai-gateway/common/logger"
-
-	_ "github.com/ClickHouse/clickhouse-go/v2" // register driver
 )
 
 var (
-	db     *sql.DB
+	client *httpClient
 	once   sync.Once
 	worker *asyncWorker
 )
@@ -30,31 +29,26 @@ func Init() {
 		return
 	}
 	once.Do(func() {
-		var err error
-		db, err = sql.Open("clickhouse", config.ClickHouseDSN)
+		c, err := newHTTPClient(config.ClickHouseDSN, config.ClickHouseDatabase)
 		if err != nil {
-			logger.SysLogf("clickhouse: failed to open connection: %v", err)
+			logger.SysLogf("clickhouse: failed to parse DSN: %v", err)
 			return
 		}
-		db.SetMaxOpenConns(10)
-		db.SetMaxIdleConns(5)
-		db.SetConnMaxLifetime(time.Minute * 5)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err = db.PingContext(ctx); err != nil {
+		if err = c.ping(ctx); err != nil {
 			logger.SysLogf("clickhouse: ping failed: %v", err)
-			db = nil
 			return
 		}
 
-		if err = ensureSchema(db, config.ClickHouseDatabase, config.ClickHouseRetentionDays); err != nil {
+		if err = ensureSchema(c, config.ClickHouseDatabase, config.ClickHouseRetentionDays); err != nil {
 			logger.SysLogf("clickhouse: schema setup failed: %v", err)
-			db = nil
 			return
 		}
 
-		worker = newAsyncWorker(db, config.ClickHouseBatchSize, config.ClickHouseFlushInterval)
+		client = c
+		worker = newAsyncWorker(c, config.ClickHouseBatchSize, config.ClickHouseFlushInterval)
 		worker.start()
 		logger.SysLog("clickhouse: connection established and worker started")
 	})
@@ -62,7 +56,7 @@ func Init() {
 
 // Enabled reports whether ClickHouse logging is active.
 func Enabled() bool {
-	return db != nil && worker != nil
+	return client != nil && worker != nil
 }
 
 // Enqueue adds an APICallLog to the async write queue. It is non-blocking.
@@ -79,22 +73,48 @@ func Close() {
 	if worker != nil {
 		worker.stop()
 	}
-	if db != nil {
-		_ = db.Close()
+}
+
+// parseDSN accepts either:
+//
+//	clickhouse://user:pass@host:9000/database  (native – mapped to HTTP)
+//	http://user:pass@host:8123/database
+//	https://user:pass@host:8443/database
+func parseDSN(dsn string) (httpBase, database, user, password string, err error) {
+	// Normalise clickhouse:// → http://
+	normalised := dsn
+	if strings.HasPrefix(dsn, "clickhouse://") {
+		// Replace scheme and default native port 9000 with HTTP port 8123.
+		normalised = strings.Replace(dsn, "clickhouse://", "http://", 1)
+		normalised = strings.Replace(normalised, ":9000/", ":8123/", 1)
 	}
+	u, err2 := url.Parse(normalised)
+	if err2 != nil {
+		return "", "", "", "", fmt.Errorf("parse DSN: %w", err2)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", "", "", "", fmt.Errorf("unsupported scheme %q; use http, https or clickhouse", u.Scheme)
+	}
+	if u.User != nil {
+		user = u.User.Username()
+		password, _ = u.User.Password()
+	}
+	database = strings.TrimPrefix(u.Path, "/")
+	base := u.Scheme + "://" + u.Host
+	return base, database, user, password, nil
 }
 
 // ensureSchema creates the database, main log table, daily aggregate table and
 // the materialized view that keeps the aggregate up to date.
-func ensureSchema(db *sql.DB, database string, retentionDays int) error {
+func ensureSchema(c *httpClient, database string, retentionDays int) error {
 	ttl := fmt.Sprintf("toDate(created_at) + INTERVAL %d DAY", retentionDays)
 
 	stmts := []string{
-		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", database),
+		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", database),
 
 		// ── Main request/response log table ─────────────────────────────────
 		fmt.Sprintf(`
-CREATE TABLE IF NOT EXISTS %s.llm_api_call_log
+CREATE TABLE IF NOT EXISTS `+"`%s`"+`.llm_api_call_log
 (
     event_date        Date     DEFAULT toDate(created_at),
     created_at        DateTime64(3),
@@ -110,7 +130,7 @@ CREATE TABLE IF NOT EXISTS %s.llm_api_call_log
     model_id          UInt64   DEFAULT 0,
     model_name        LowCardinality(String) DEFAULT '',
 
-    status            LowCardinality(String) DEFAULT '',  -- success / error / timeout
+    status            LowCardinality(String) DEFAULT '',
     http_status_code  UInt16   DEFAULT 0,
     error_code        String   DEFAULT '',
     error_message     String   DEFAULT '',
@@ -143,7 +163,7 @@ SETTINGS index_granularity = 8192
 
 		// ── Daily aggregate table ────────────────────────────────────────────
 		fmt.Sprintf(`
-CREATE TABLE IF NOT EXISTS %s.llm_api_call_daily_stats
+CREATE TABLE IF NOT EXISTS `+"`%s`"+`.llm_api_call_daily_stats
 (
     stat_date               Date,
     user_id                 UInt64,
@@ -168,8 +188,8 @@ ORDER BY (stat_date, user_id, channel_id, model_name)
 
 		// ── Materialized view → daily stats ──────────────────────────────────
 		fmt.Sprintf(`
-CREATE MATERIALIZED VIEW IF NOT EXISTS %s.mv_llm_api_call_daily_stats
-TO %s.llm_api_call_daily_stats
+CREATE MATERIALIZED VIEW IF NOT EXISTS `+"`%[1]s`"+`.mv_llm_api_call_daily_stats
+TO `+"`%[1]s`"+`.llm_api_call_daily_stats
 AS
 SELECT
     event_date                        AS stat_date,
@@ -185,15 +205,18 @@ SELECT
     sum(quota)                        AS total_quota,
     avg(latency_ms)                   AS avg_latency_ms,
     quantile(0.95)(latency_ms)        AS p95_latency_ms
-FROM %s.llm_api_call_log
+FROM `+"`%[1]s`"+`.llm_api_call_log
 GROUP BY stat_date, user_id, channel_id, model_name
-`, database, database, database),
+`, database),
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	for _, stmt := range stmts {
-		if _, err := db.Exec(stmt); err != nil {
+		if err := c.exec(ctx, stmt); err != nil {
 			return fmt.Errorf("exec schema stmt: %w\nSQL: %s", err, stmt)
 		}
 	}
 	return nil
 }
+
