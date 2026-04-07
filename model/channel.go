@@ -34,6 +34,31 @@ func GetChannelById(id int) (*Channel, error) {
 	return &channel, nil
 }
 
+// GetChannelByModel returns the first enabled channel that lists modelName in
+// its comma-separated models field, or — if no channel has that model listed —
+// the first enabled channel overall.  This gives a sensible default without
+// requiring the caller to know the channel ID.
+func GetChannelByModel(modelName string) (*Channel, error) {
+	var channel Channel
+	// Try exact model match first (models field is comma-separated)
+	if modelName != "" {
+		if err := DB.Where("status = ? AND (models LIKE ? OR models LIKE ? OR models LIKE ? OR models = ?)",
+			ChannelStatusEnabled,
+			modelName+",%",
+			"%,"+modelName+",%",
+			"%,"+modelName,
+			modelName,
+		).First(&channel).Error; err == nil {
+			return &channel, nil
+		}
+	}
+	// Fallback: first enabled channel
+	if err := DB.Where("status = ?", ChannelStatusEnabled).First(&channel).Error; err != nil {
+		return nil, err
+	}
+	return &channel, nil
+}
+
 func UpdateChannelUsedQuota(channelId int, quota int64) {
 	DB.Model(&Channel{}).Where("id = ?", channelId).Updates(map[string]any{
 		"used_quota":    gorm.Expr("used_quota + ?", quota),

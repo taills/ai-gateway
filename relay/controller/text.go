@@ -44,9 +44,16 @@ func RelayTextHelper(c *gin.Context) *relaymodel.ErrorWithStatusCode {
 	m.IsStream = textRequest.Stream
 
 	// ── Fetch channel ────────────────────────────────────────────────────────
-	channel, err := dbmodel.GetChannelById(m.ChannelID)
+	// If no channel was pre-selected (ChannelID == 0), pick one automatically
+	// based on the requested model name.
+	var channel *dbmodel.Channel
+	if m.ChannelID != 0 {
+		channel, err = dbmodel.GetChannelById(m.ChannelID)
+	} else {
+		channel, err = dbmodel.GetChannelByModel(m.ModelName)
+	}
 	if err != nil {
-		return wrapError(fmt.Errorf("channel not found: %d", m.ChannelID), "channel_not_found", http.StatusBadRequest)
+		return wrapError(fmt.Errorf("no available channel for model %q", m.ModelName), "channel_not_found", http.StatusBadGateway)
 	}
 	m.ChannelName = channel.Name
 	m.ChannelType = channel.Type
