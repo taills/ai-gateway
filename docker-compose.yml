@@ -1,0 +1,68 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aigateway
+      POSTGRES_PASSWORD: aigateway
+      POSTGRES_DB: aigateway
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aigateway"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── ClickHouse ─────────────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: aigateway
+      CLICKHOUSE_PASSWORD: aigateway
+      CLICKHOUSE_DB: ai_gateway
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9000:9000"   # Native TCP interface
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user aigateway --password aigateway --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── AI Gateway ─────────────────────────────────────────────────────────────
+  ai-gateway:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      PORT: "3000"
+      SQL_DSN: "postgres://aigateway:aigateway@postgres:5432/aigateway?sslmode=disable"
+      CLICKHOUSE_DSN: "clickhouse://aigateway:aigateway@clickhouse:9000/ai_gateway"
+      CLICKHOUSE_ENABLED: "true"
+      CLICKHOUSE_RETENTION_DAYS: "90"
+      CLICKHOUSE_BATCH_SIZE: "500"
+      CLICKHOUSE_FLUSH_INTERVAL: "5s"
+      GIN_MODE: "release"
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
+  clickhouse_data:
