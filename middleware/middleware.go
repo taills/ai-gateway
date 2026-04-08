@@ -47,6 +47,8 @@ func Auth() gin.HandlerFunc {
 			return
 		}
 
+		go touchTokenAsync(token.Id)
+
 		c.Set("user_id", token.UserId)
 		c.Set("token_id", token.Id)
 		c.Set("token_name", token.Name)

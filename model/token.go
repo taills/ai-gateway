@@ -26,7 +26,12 @@ type Token struct {
 
 func GetTokenByKey(key string) (*Token, error) {
 	var token Token
-	if err := DB.Where("key = ? AND status = ?", key, TokenStatusEnabled).First(&token).Error; err != nil {
+	now := helper.GetTimestamp()
+	// expired_time == -1 means never expires; otherwise reject if past expiry.
+	if err := DB.Where(
+		"key = ? AND status = ? AND (expired_time = -1 OR expired_time > ?)",
+		key, TokenStatusEnabled, now,
+	).First(&token).Error; err != nil {
 		return nil, err
 	}
 	return &token, nil
@@ -38,7 +43,8 @@ func PreConsumeTokenQuota(tokenId int, quota int64) error {
 }
 
 func PostConsumeTokenQuota(tokenId int, quotaDelta int64) error {
-	return DB.Model(&Token{}).Where("id = ?", tokenId).
+	// Only deduct from tokens that have a finite quota; unlimited tokens are skipped.
+	return DB.Model(&Token{}).Where("id = ? AND unlimited_quota = false", tokenId).
 		Update("remain_quota", gorm.Expr("remain_quota - ?", quotaDelta)).Error
 }
 

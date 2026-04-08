@@ -55,11 +55,16 @@ func RelayTextHelper(c *gin.Context) *relaymodel.ErrorWithStatusCode {
 	if err != nil {
 		return wrapError(fmt.Errorf("no available channel for model %q", m.ModelName), "channel_not_found", http.StatusBadGateway)
 	}
+	m.ChannelID = channel.Id
 	m.ChannelName = channel.Name
 	m.ChannelType = channel.Type
 	m.APIKey = channel.Key
 	if channel.BaseURL != "" {
 		m.BaseURL = channel.BaseURL
+	}
+	// Populate username for logging if not already set by middleware.
+	if m.Username == "" && m.UserID > 0 {
+		m.Username = dbmodel.GetUsernameById(m.UserID)
 	}
 
 	// ── Forward to upstream ──────────────────────────────────────────────────
@@ -313,6 +318,9 @@ func postConsumeQuota(ctx context.Context, m *meta.Meta, req *relaymodel.General
 	quota := int64(totalTokens)
 	dbmodel.UpdateUserUsedQuotaAndRequestCount(m.UserID, quota)
 	dbmodel.UpdateChannelUsedQuota(m.ChannelID, quota)
+	if err := dbmodel.PostConsumeTokenQuota(m.TokenID, quota); err != nil {
+		logger.Errorf(ctx, "failed to deduct token quota: %v", err)
+	}
 	dbmodel.RecordConsumeLog(ctx, &dbmodel.Log{
 		UserId:           m.UserID,
 		ChannelId:        m.ChannelID,
